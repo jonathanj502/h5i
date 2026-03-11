@@ -1,17 +1,21 @@
 use git2::{Blob, Repository};
 use git2::{Commit, ObjectType, Oid, Signature};
-use sha2::{Digest as _, Sha256};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use yrs::updates::decoder::Decode;
+use yrs::{GetString, Text, Transact};
 
 use crate::blame::{BlameMode, BlameResult};
+use crate::delta_store::{sha256_hash, DeltaStore};
 use crate::error::H5iError;
 use crate::metadata::{AiMetadata, H5iCommitRecord, TestMetrics};
 
 pub struct H5iRepository {
     git_repo: Repository,
-    h5i_root: PathBuf,
+    pub h5i_root: PathBuf,
 }
 
 // ============================================================
@@ -402,6 +406,150 @@ impl H5iRepository {
 }
 
 // ============================================================
+// Resolve Conflict
+// ============================================================
+
+impl H5iRepository {
+    /// 二つのブランチ（またはコミット）間のCRDT操作を統合し、コンフリクトなしのテキストを生成する
+    pub fn merge_h5i_logic(
+        &self,
+        our_oid: Oid,
+        their_oid: Oid,
+        file_path: &str,
+    ) -> Result<String, H5iError> {
+        let base_oid = self.git_repo.merge_base(our_oid, their_oid)?;
+
+        // 1. 共通祖先 (Base) の完全な状態を復元する
+        // (ここでは操作ログを最初からマージベースまで再生して Doc を作る)
+        let mut doc = yrs::Doc::new();
+        let text_ref = doc.get_or_insert_text("code");
+
+        // 起点となるベースまでの全履歴を適用
+        self.apply_all_updates_up_to(base_oid, file_path, &mut doc)?;
+
+        // 2. OURS と THEIRS の差分（Update）を取得してマージ
+        // 状態を分岐させず、同じ Doc に対して両方のブランチの「差分のみ」を適用する
+        self.apply_updates_between(base_oid, our_oid, file_path, &mut doc)?;
+        self.apply_updates_between(base_oid, their_oid, file_path, &mut doc)?;
+
+        let txn = doc.transact();
+        Ok(text_ref.get_string(&txn))
+    }
+
+    /// 特定の範囲のコミットに紐づくデルタログをすべて適用する補助関数
+    fn apply_updates_between(
+        &self,
+        base: Oid,
+        tip: Oid,
+        file_path: &str,
+        doc: &mut yrs::Doc,
+    ) -> Result<(), H5iError> {
+        let mut revwalk = self.git_repo.revwalk()?;
+        revwalk.push(tip)?;
+        revwalk.hide(base)?;
+
+        for oid_res in revwalk {
+            let oid = oid_res?;
+            // 【重要】そのコミット固有のデルタ（Update）をロードする
+            // 以前実装した「h5i commit」で、コミット時にこのUpdateをサイドカーに保存しておく設計が必要
+            if let Ok(update_data) = self.load_specific_delta_for_commit(oid, file_path) {
+                let mut txn = doc.transact_mut();
+                txn.apply_update(yrs::Update::decode_v1(&update_data)?);
+            }
+        }
+        Ok(())
+    }
+
+    /// 履歴の最初から指定した base_oid まで、すべての差分を順番に適用して Doc を構築する
+    pub fn apply_all_updates_up_to(
+        &self,
+        base_oid: Oid,
+        file_path: &str,
+        doc: &mut yrs::Doc,
+    ) -> Result<(), H5iError> {
+        let mut revwalk = self.git_repo.revwalk()?;
+        revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?; // 古い順に歩く
+        revwalk.push(base_oid)?;
+
+        for oid_res in revwalk {
+            let oid = oid_res?;
+            if let Ok(update_data) = self.load_specific_delta_for_commit(oid, file_path) {
+                let mut txn = doc.transact_mut();
+                txn.apply_update(yrs::Update::decode_v1(&update_data)?);
+            } else {
+                // サイドカーにデルタがない（通常の人間によるコミットなど）場合のフォールバック
+                // その時点のファイル内容を「まるごと挿入」として扱う
+                self.fallback_ingest_content(oid, file_path, doc)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 特定のコミット時に保存された、そのファイル固有の Update バイナリをロードする
+    pub fn load_specific_delta_for_commit(
+        &self,
+        oid: Oid,
+        file_path: &str,
+    ) -> Result<Vec<u8>, H5iError> {
+        // .h5i/deltas/<oid>/<file_hash>.bin という構造を想定
+        let file_hash = sha256_hash(file_path);
+        let delta_path = self
+            .h5i_root
+            .join("deltas")
+            .join(oid.to_string())
+            .join(format!("{}.bin", file_hash));
+
+        if !delta_path.exists() {
+            return Err(H5iError::Internal("Delta not found for this commit".into()));
+        }
+
+        let mut file = std::fs::File::open(&delta_path)?;
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer)?;
+        Ok(buffer)
+    }
+
+    /// サイドカーがないコミットの場合、Git から内容を読み取って CRDT に「全置換」として注入する
+    fn fallback_ingest_content(
+        &self,
+        oid: Oid,
+        file_path: &str,
+        doc: &mut yrs::Doc,
+    ) -> Result<(), H5iError> {
+        let content = self.get_content_at_oid(oid, std::path::Path::new(file_path))?;
+        let text_ref = doc.get_or_insert_text("code");
+        let mut txn = doc.transact_mut();
+
+        // 既存の内容を消して、新しい内容を書き込む
+        let len = text_ref.len(&txn);
+        text_ref.remove_range(&mut txn, 0, len);
+        text_ref.push(&mut txn, &content);
+        Ok(())
+    }
+
+    /// そのコミットで発生した差分（Update）を、OID付きのサイドカーとして永続化する
+    pub fn persist_delta_for_commit(
+        &self,
+        oid: Oid,
+        file_path: &str,
+        update_data: &[u8],
+    ) -> Result<(), H5iError> {
+        let file_hash = sha256_hash(file_path);
+        let delta_dir = self.h5i_root.join("deltas").join(oid.to_string());
+
+        // ディレクトリ作成
+        std::fs::create_dir_all(&delta_dir).map_err(|e| H5iError::Io(e))?;
+
+        let delta_path = delta_dir.join(format!("{}.bin", file_hash));
+
+        // 差分バイナリを書き込み
+        std::fs::write(&delta_path, update_data).map_err(|e| H5iError::Io(e))?;
+
+        Ok(())
+    }
+}
+
+// ============================================================
 // Internal helpers
 // ============================================================
 
@@ -444,6 +592,43 @@ impl H5iRepository {
         // 5. OID を使用して実際の Blob オブジェクトを検索して返す
         let blob = self.git_repo.find_blob(entry.id())?;
         Ok(blob)
+    }
+
+    /// 指定された OID (コミット等) における特定のパスの Blob を取得する
+    pub fn get_blob_at_oid(&self, oid: Oid, path: &Path) -> Result<Blob, H5iError> {
+        // 1. OID からコミットオブジェクトを探す
+        let commit = self
+            .git_repo
+            .find_commit(oid)
+            .map_err(|e| H5iError::Internal(format!("Commit not found {}: {}", oid, e)))?;
+
+        // 2. コミットに紐づくツリー（ディレクトリ構造）を取得
+        let tree = commit.tree().map_err(|e| {
+            H5iError::Internal(format!("Failed to get tree for commit {}: {}", oid, e))
+        })?;
+
+        // 3. ツリーの中から指定されたパスのエントリを探す
+        let entry = tree.get_path(path).map_err(|_| {
+            H5iError::InvalidPath(format!("Path {:?} not found in commit {}", path, oid))
+        })?;
+
+        // 4. エントリの ID から実際のデータ（Blob）を取得
+        let blob = self.git_repo.find_blob(entry.id()).map_err(|e| {
+            H5iError::Internal(format!("Failed to find blob for path {:?}: {}", path, e))
+        })?;
+
+        Ok(blob)
+    }
+
+    /// (便利関数) 指定された OID の内容を String として取得する
+    pub fn get_content_at_oid(&self, oid: Oid, path: &Path) -> Result<String, H5iError> {
+        let blob = self.get_blob_at_oid(oid, path)?;
+
+        // UTF-8 チェックを行いながら文字列に変換
+        let content = std::str::from_utf8(blob.content())
+            .map_err(|_| H5iError::Internal(format!("File at {:?} is not valid UTF-8", path)))?;
+
+        Ok(content.to_string())
     }
 
     /// // h5_i_test_start ～ // h5_i_test_end を抽出してハッシュ化
@@ -516,5 +701,147 @@ impl H5iRepository {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use git2::{Oid, Repository, Signature};
+    use std::fs;
+    use tempfile::tempdir;
+    use yrs::{Doc, Text, Transact, Update};
+
+    // --- テスト用ヘルパー ---
+
+    /// テスト用の Git リポジトリを初期化し、H5iRepository を返す
+    fn setup_test_repo(root: &std::path::Path) -> H5iRepository {
+        let repo = Repository::init(root).unwrap();
+        let h5i_root = root.join(".h5i");
+        fs::create_dir_all(h5i_root.join("metadata")).unwrap();
+        fs::create_dir_all(h5i_root.join("delta")).unwrap();
+
+        H5iRepository {
+            git_repo: repo,
+            h5i_root,
+        }
+    }
+
+    /// Git コミットを作成するヘルパー
+    fn create_commit(
+        repo: &Repository,
+        message: &str,
+        file_path: &str,
+        content: &str,
+        parents: &[&git2::Commit],
+    ) -> Oid {
+        let mut index = repo.index().unwrap();
+        let path = std::path::Path::new(file_path);
+
+        // ファイルを物理的に書き込んでインデックスに追加
+        fs::write(repo.workdir().unwrap().join(path), content).unwrap();
+        index.add_path(path).unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+
+        let sig = Signature::now("test", "test@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, parents)
+            .unwrap()
+    }
+
+    // --- テストケース ---
+
+    #[test]
+    fn test_get_content_at_oid() {
+        let dir = tempdir().unwrap();
+        let h5i_repo = setup_test_repo(dir.path());
+        let git_repo = &h5i_repo.git_repo;
+
+        // 1. コミットを作成
+        let oid = create_commit(git_repo, "initial", "hello.txt", "hello world", &[]);
+
+        // 2. 取得検証
+        let content = h5i_repo
+            .get_content_at_oid(oid, std::path::Path::new("hello.txt"))
+            .unwrap();
+        assert_eq!(content, "hello world");
+    }
+
+    #[test]
+    fn test_merge_h5i_logic_with_proper_deltas() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir().unwrap();
+        let h5i_repo = setup_test_repo(dir.path());
+        let git_repo = &h5i_repo.git_repo;
+        let file_path = "main.py";
+
+        // --- 1. Base (共通祖先) ---
+        let base_content = "def main():\n    pass";
+        let base_oid = create_commit(git_repo, "base", file_path, base_content, &[]);
+        // ベース時点のデルタも保存（空の状態からの挿入として記録）
+        let base_update = {
+            let doc = Doc::new();
+            let text = doc.get_or_insert_text("code");
+            let mut txn = doc.transact_mut();
+            text.push(&mut txn, base_content);
+            txn.encode_update_v1()
+        };
+        h5i_repo.persist_delta_for_commit(base_oid, file_path, &base_update)?;
+
+        // --- 2. OURS (自分側の変更) ---
+        let (our_oid, our_update) = {
+            let doc = Doc::new();
+            let text = doc.get_or_insert_text("code");
+            // ベースを再現
+            let mut txn = doc.transact_mut();
+            txn.apply_update(Update::decode_v1(&base_update)?);
+            // 変更を加える
+            text.insert(&mut txn, 0, "# OURS COMMENT\n");
+            let update = txn.encode_update_v1(); // ここでは「差分」ではなく「全状態」として一旦扱う（簡易化のため）
+
+            let base_commit = git_repo.find_commit(base_oid)?;
+            let oid = create_commit(
+                git_repo,
+                "ours",
+                file_path,
+                &text.get_string(&txn),
+                &[&base_commit],
+            );
+            (oid, update)
+        };
+        h5i_repo.persist_delta_for_commit(our_oid, file_path, &our_update)?;
+
+        // --- 3. THEIRS (相手側の変更) ---
+        git_repo.set_head_detached(base_oid)?;
+        let (their_oid, their_update) = {
+            let doc = Doc::new();
+            let text = doc.get_or_insert_text("code");
+            let mut txn = doc.transact_mut();
+            txn.apply_update(Update::decode_v1(&base_update)?);
+            // 変更を加える
+            text.push(&mut txn, "\nprint('done')");
+            let update = txn.encode_update_v1();
+
+            let base_commit = git_repo.find_commit(base_oid)?;
+            let oid = create_commit(
+                git_repo,
+                "theirs",
+                file_path,
+                &text.get_string(&txn),
+                &[&base_commit],
+            );
+            (oid, update)
+        };
+        h5i_repo.persist_delta_for_commit(their_oid, file_path, &their_update)?;
+
+        // --- 4. Merge 実行 ---
+        let merged_text = h5i_repo.merge_h5i_logic(our_oid, their_oid, file_path)?;
+
+        // --- 5. 検証 ---
+        println!("Final Merged Text:\n{}", merged_text);
+        assert!(merged_text.contains("# OURS COMMENT"));
+        assert!(merged_text.contains("print('done')"));
+        assert!(merged_text.contains("def main():"));
+
+        Ok(())
     }
 }
