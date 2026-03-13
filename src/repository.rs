@@ -1,3 +1,4 @@
+use base64::prelude::*;
 use console::style;
 use git2::{Blob, Repository};
 use git2::{Commit, ObjectType, Oid, Signature};
@@ -152,6 +153,7 @@ impl H5iRepository {
         // 1. Prepare optional features
         let mut ast_hashes = None;
         let mut test_metrics = None;
+        let mut crdt_states = HashMap::new();
 
         // Scan staged files
         for entry in index.iter() {
@@ -159,7 +161,7 @@ impl H5iRepository {
             let path_str = std::str::from_utf8(path_bytes).unwrap();
             let full_path = self.git_repo.workdir().unwrap().join(path_str);
 
-            // A. AST generation (optional)
+            // Harvest AST (Optional)
             if let Some(parser) = ast_parser {
                 let hashes = ast_hashes.get_or_insert_with(HashMap::new);
                 if let Some(sexp) = parser(&full_path) {
@@ -168,7 +170,12 @@ impl H5iRepository {
                 }
             }
 
-            // B. Extract test provenance (optional)
+            // HARVEST: Read the latest local CRDT state managed by the Watcher
+            if let Ok(state_b64) = self.load_local_crdt_state_as_base64(path_str) {
+                crdt_states.insert(path_str.to_string(), state_b64);
+            }
+
+            // Extract test provenance (optional)
             if enable_test_tracking && test_metrics.is_none() {
                 test_metrics = self.scan_test_block(&full_path);
             }
@@ -194,14 +201,35 @@ impl H5iRepository {
             ai_metadata: ai_meta,
             test_metrics,
             ast_hashes,
-            crdt_delta: None,
+            crdt_states: if crdt_states.is_empty() {
+                None
+            } else {
+                Some(crdt_states)
+            },
             timestamp: chrono::Utc::now(),
         };
         let metadata_json = serde_json::to_string(&record)?;
         self.git_repo
-            .note(author, committer, None, commit_oid, &metadata_json, false)?;
+            .note(author, committer, None, commit_oid, &metadata_json, true)?;
 
         Ok(commit_oid)
+    }
+
+    /// Reads local binary deltas from .git/h5i/delta and encodes them for the Note.
+    fn load_local_crdt_state_as_base64(&self, file_path: &str) -> Result<String, H5iError> {
+        let file_hash = crate::delta_store::sha256_hash(file_path);
+        let delta_path = self
+            .h5i_root
+            .join("delta")
+            .join(format!("{}.bin", file_hash));
+
+        if !delta_path.exists() {
+            return Err(H5iError::RecordNotFound(file_path.to_string()));
+        }
+
+        let binary_data = fs::read(&delta_path)?;
+        // Use standard base64 encoding (requires base64 crate)
+        Ok(BASE64_STANDARD.encode(binary_data))
     }
 
     fn count_tokens_internal(&self, text: &str, model: &str) -> usize {
@@ -734,21 +762,38 @@ impl H5iRepository {
         their_oid: Oid,
         file_path: &str,
     ) -> Result<String, H5iError> {
-        let base_oid = self.git_repo.merge_base(our_oid, their_oid)?;
+        // 1. Load mathematical context from Git Notes
+        let our_record = self.load_h5i_record(our_oid)?;
+        let their_record = self.load_h5i_record(their_oid)?;
 
-        // 1. Reconstruct the full state of the common ancestor (base)
-        // by replaying all updates from the beginning up to the merge base.
-        let mut doc = yrs::Doc::new();
+        // 2. Initialize a clean CRDT document
+        let doc = yrs::Doc::new();
         let text_ref = doc.get_or_insert_text("code");
 
-        // Apply the entire history up to the base commit
-        self.apply_all_updates_up_to(base_oid, file_path, &mut doc)?;
+        // 3. Apply state from OURS
+        if let Some(states) = our_record.crdt_states {
+            if let Some(b64) = states.get(file_path) {
+                let data = BASE64_STANDARD
+                    .decode(b64)
+                    .map_err(|e| H5iError::Crdt(e.to_string()))?;
+                let mut txn = doc.transact_mut();
+                txn.apply_update(yrs::Update::decode_v1(&data)?)?;
+            }
+        }
 
-        // 2. Retrieve and merge updates from OURS and THEIRS
-        // Apply only the incremental updates from each branch to the same document.
-        self.apply_updates_between(base_oid, our_oid, file_path, &mut doc)?;
-        self.apply_updates_between(base_oid, their_oid, file_path, &mut doc)?;
+        // 4. Apply state from THEIRS (The "Magic" automatic merge)
+        if let Some(states) = their_record.crdt_states {
+            if let Some(b64) = states.get(file_path) {
+                let data = BASE64_STANDARD
+                    .decode(b64)
+                    .map_err(|e| H5iError::Crdt(e.to_string()))?;
+                let mut txn = doc.transact_mut();
+                // CRDT math ensures this is conflict-free and commutative
+                txn.apply_update(yrs::Update::decode_v1(&data)?)?;
+            }
+        }
 
+        // 5. Extract and return the unified text
         let txn = doc.transact();
         Ok(text_ref.get_string(&txn))
     }
@@ -1337,6 +1382,7 @@ mod tests {
     use git2::{Oid, Repository, Signature};
     use std::fs;
     use tempfile::tempdir;
+    use yrs::ReadTxn;
     use yrs::{Doc, Text, Transact, Update};
 
     fn setup_test_repo(root: &std::path::Path) -> H5iRepository {
@@ -1527,29 +1573,51 @@ mod tests {
         let h5i_repo = setup_test_repo(dir.path());
         let git_repo = &h5i_repo.git_repo;
         let file_path = "main.py";
+        let sig = git_repo.signature()?;
 
+        // Helper to attach metadata to a commit via Git Notes
+        let attach_metadata =
+            |oid: Oid, update: Vec<u8>| -> Result<(), Box<dyn std::error::Error>> {
+                let mut crdt_states = std::collections::HashMap::new();
+                crdt_states.insert(file_path.to_string(), base64::encode(update));
+
+                let record = H5iCommitRecord {
+                    git_oid: oid.to_string(),
+                    parent_oid: None, // Simplified for test
+                    ai_metadata: None,
+                    test_metrics: None,
+                    ast_hashes: None,
+                    crdt_states: Some(crdt_states),
+                    timestamp: chrono::Utc::now(),
+                };
+
+                let json = serde_json::to_string(&record)?;
+                git_repo.note(&sig, &sig, None, oid, &json, true)?;
+                Ok(())
+            };
+
+        // --- 1. BASE ---
         let base_content = "def main():\n    pass";
         let base_oid = create_commit(git_repo, "base", file_path, base_content, &[]);
 
         let base_update = {
-            let doc = Doc::new();
+            let doc = yrs::Doc::new();
             let text = doc.get_or_insert_text("code");
             let mut txn = doc.transact_mut();
             text.push(&mut txn, base_content);
-            txn.encode_update_v1()
+            txn.encode_state_as_update_v1(&yrs::StateVector::default())
         };
-        h5i_repo.persist_delta_for_commit(base_oid, file_path, &base_update)?;
+        attach_metadata(base_oid, base_update.clone())?;
 
         // --- 2. OURS ---
-        let (our_oid, our_update) = {
-            let doc = Doc::new();
+        let (our_oid, _our_update) = {
+            let doc = yrs::Doc::new();
             let text = doc.get_or_insert_text("code");
-
             let mut txn = doc.transact_mut();
-            txn.apply_update(Update::decode_v1(&base_update)?)?;
+            txn.apply_update(yrs::Update::decode_v1(&base_update)?)?;
 
             text.insert(&mut txn, 0, "# OURS COMMENT\n");
-            let update = txn.encode_update_v1();
+            let full_state = txn.encode_state_as_update_v1(&yrs::StateVector::default());
 
             let base_commit = git_repo.find_commit(base_oid)?;
             let oid = create_commit(
@@ -1559,20 +1627,20 @@ mod tests {
                 &text.get_string(&txn),
                 &[&base_commit],
             );
-            (oid, update)
+            (oid, full_state)
         };
-        h5i_repo.persist_delta_for_commit(our_oid, file_path, &our_update)?;
+        attach_metadata(our_oid, _our_update)?;
 
         // --- 3. THEIRS ---
         git_repo.set_head_detached(base_oid)?;
-        let (their_oid, their_update) = {
-            let doc = Doc::new();
+        let (their_oid, _their_update) = {
+            let doc = yrs::Doc::new();
             let text = doc.get_or_insert_text("code");
             let mut txn = doc.transact_mut();
-            txn.apply_update(Update::decode_v1(&base_update)?)?;
+            txn.apply_update(yrs::Update::decode_v1(&base_update)?)?;
 
             text.push(&mut txn, "\nprint('done')");
-            let update = txn.encode_update_v1();
+            let full_state = txn.encode_state_as_update_v1(&yrs::StateVector::default());
 
             let base_commit = git_repo.find_commit(base_oid)?;
             let oid = create_commit(
@@ -1582,11 +1650,12 @@ mod tests {
                 &text.get_string(&txn),
                 &[&base_commit],
             );
-            (oid, update)
+            (oid, full_state)
         };
-        h5i_repo.persist_delta_for_commit(their_oid, file_path, &their_update)?;
+        attach_metadata(their_oid, _their_update)?;
 
         // --- 4. Merge ---
+        // The merge logic now pulls context from the Notes we attached above
         let merged_text = h5i_repo.merge_h5i_logic(our_oid, their_oid, file_path)?;
 
         // --- 5. Verify ---
@@ -1681,12 +1750,34 @@ mod integration_tests {
         let full_path = dir.path().join(file_path);
         let sig = git2::Signature::now("h5i-tester", "test@h5i.io")?;
 
+        // Helper to bundle and attach CRDT state to a commit via Git Notes
+        let attach_h5i_note = |oid: git2::Oid, doc: &yrs::Doc| -> crate::error::Result<()> {
+            let mut crdt_states = std::collections::HashMap::new();
+            // Capture the FULL state at the time of commit
+            let state = doc
+                .transact()
+                .encode_state_as_update_v1(&yrs::StateVector::default());
+            crdt_states.insert(file_path.to_string(), base64::encode(state));
+
+            let record = crate::metadata::H5iCommitRecord {
+                git_oid: oid.to_string(),
+                parent_oid: None,
+                ai_metadata: None,
+                test_metrics: None,
+                ast_hashes: None,
+                crdt_states: Some(crdt_states),
+                timestamp: chrono::Utc::now(),
+            };
+
+            let metadata_json = serde_json::to_string(&record).unwrap();
+            git_repo.note(&sig, &sig, None, oid, &metadata_json, true)?;
+            Ok(())
+        };
+
         // --- PHASE 1: Base Commit ---
-        // Start from an empty state to ensure the first insertion is recorded as a delta
         fs::write(&full_path, "")?;
         let mut session_ours = LocalSession::new(h5i_repo.h5i_root.clone(), full_path.clone(), 1)?;
 
-        // Initial code: 20 characters long
         let base_content = "def main():\n    pass";
         session_ours.apply_local_edit(0, base_content)?;
 
@@ -1695,68 +1786,72 @@ mod integration_tests {
         let base_oid = h5i_repo.commit("base", &sig, &sig, None, false, None)?;
         let base_commit = git_repo.find_commit(base_oid)?;
 
-        // Capture BASE state for later diffing
-        let base_delta = yrs::merge_updates_v1(&session_ours.delta_store.read_all_updates()?)
-            .map_err(|e| crate::error::H5iError::Crdt(e.to_string()))?;
-        let base_sv = session_ours.doc.transact().state_vector();
-        h5i_repo.persist_delta_for_commit(base_oid, file_path, &base_delta)?;
+        // Attach mathematical state to the BASE commit note
+        attach_h5i_note(base_oid, &session_ours.doc)?;
 
         // --- PHASE 2: Branch OURS ---
-        // OURS adds a header at the very beginning (Index 0)
         session_ours.apply_local_edit(0, "# Header\n")?;
 
-        // Save incremental delta for OURS
-        // For testing, we use encode_state_as_update or diff to get ONLY the new parts
         let our_oid = h5i_repo.commit("ours", &sig, &sig, None, false, None)?;
-        let ours_diff: Vec<u8> = session_ours.doc.transact().encode_diff_v1(&base_sv);
-        h5i_repo.persist_delta_for_commit(our_oid, file_path, &ours_diff)?;
+        // Attach mathematical state to the OURS commit note
+        attach_h5i_note(our_oid, &session_ours.doc)?;
 
         // --- PHASE 3: Branch THEIRS ---
-        // Switch "context" back to base
+        // Move back to base and simulate a different user/client
         git_repo.set_head_detached(base_oid)?;
 
-        // CRITICAL: We create a new doc and APPLY the base_delta
-        // to ensure character IDs match exactly.
         let doc_theirs = yrs::Doc::with_options(yrs::Options {
             client_id: 2,
             ..Default::default()
         });
         let text_theirs = doc_theirs.get_or_insert_text("code");
+
+        // Initialize THEIRS with the BASE state to ensure ID continuity
         {
+            let base_record = h5i_repo.load_h5i_record(base_oid)?;
+            let base_state_b64 = base_record
+                .crdt_states
+                .unwrap()
+                .get(file_path)
+                .unwrap()
+                .clone();
+            let base_state = base64::decode(base_state_b64).unwrap();
             let mut txn = doc_theirs.transact_mut();
-            txn.apply_update(yrs::Update::decode_v1(&base_delta)?)
-                .map_err(|e| crate::error::H5iError::Crdt(e.to_string()))?;
+            txn.apply_update(yrs::Update::decode_v1(&base_state)?)?;
         }
 
-        // Simulate a second session branching from the SAME state
         let mut session_theirs = LocalSession {
             doc: doc_theirs,
             text_ref: text_theirs,
-            delta_store: DeltaStore::new(dir.path().to_path_buf(), "theirs_temp"),
+            delta_store: crate::delta_store::DeltaStore::new(
+                dir.path().to_path_buf(),
+                "theirs_temp",
+            ),
             target_fs_path: full_path.clone(),
             update_count: 0,
             last_read_offset: 0,
         };
 
-        // THEIRS adds print at the end of "def main():\n    pass" (index 18)
         session_theirs.apply_local_edit(20, "\nprint('end')")?;
 
         let tree = git_repo.find_tree(git_repo.index()?.write_tree()?)?;
         let their_oid =
             git_repo.commit(Some("HEAD"), &sig, &sig, "theirs", &tree, &[&base_commit])?;
 
-        let theirs_diff = session_theirs.doc.transact().encode_diff_v1(&base_sv);
-        h5i_repo.persist_delta_for_commit(their_oid, file_path, &theirs_diff)?;
+        // Attach mathematical state to the THEIRS commit note
+        attach_h5i_note(their_oid, &session_theirs.doc)?;
 
         // --- PHASE 4: Semantic Merge ---
+        // merge_h5i_logic now fetches the notes for our_oid and their_oid
         let merged_text = h5i_repo.merge_h5i_logic(our_oid, their_oid, file_path)?;
 
         // Final Assertions
-        assert!(merged_text.contains("# Header"), "OURS missing");
-        assert!(merged_text.contains("print('end')"), "THEIRS missing");
-        assert!(merged_text.contains("def main():"), "BASE missing");
-
-        // Ensure no weird interleaving
+        assert!(merged_text.contains("# Header"), "OURS content missing");
+        assert!(
+            merged_text.contains("print('end')"),
+            "THEIRS content missing"
+        );
+        assert!(merged_text.contains("def main():"), "BASE content missing");
         assert!(merged_text.contains("def main():\n    pass\nprint('end')"));
 
         Ok(())
