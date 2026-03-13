@@ -192,8 +192,11 @@ impl H5iRepository {
             ast_hashes,
             timestamp: chrono::Utc::now(),
         };
+        let metadata_json = serde_json::to_string(&record)?;
+        self.git_repo
+            .note(author, committer, None, commit_oid, &metadata_json, false)?;
 
-        self.persist_h5i_record(record)?;
+        //self.persist_h5i_record(record)?;
 
         Ok(commit_oid)
     }
@@ -1625,7 +1628,6 @@ mod integration_tests {
         let merged_text = h5i_repo.merge_h5i_logic(our_oid, their_oid, file_path)?;
 
         // Final Assertions
-        println!("{}", merged_text);
         assert!(merged_text.contains("# Header"), "OURS missing");
         assert!(merged_text.contains("print('end')"), "THEIRS missing");
         assert!(merged_text.contains("def main():"), "BASE missing");
