@@ -23,6 +23,7 @@ Modern AI coding agents — Claude, Copilot, Cursor — generate tens of thousan
 - **Semantic rollback** — "undo the AI change that broke authentication" not "revert commit `a3f9c2b`"
 - **Integrity** — did the agent quietly touch CI/CD files, leak credentials, or remove safety checks?
 - **Test traceability** — what was the test pass rate at every commit, regardless of the tool used?
+- **Causal history** — which commit introduced the bug that this commit fixes?
 - **Concurrent agents** — how do two AI agents edit the same file without corrupting each other's work?
 
 h5i is the missing infrastructure layer.
@@ -37,8 +38,11 @@ Captures the prompt, model name, agent ID, and token usage alongside every commi
 **Universal Test Metrics**
 Attach structured test results from any tool (pytest, cargo test, Jest, Go test, …) to every commit via a neutral JSON adapter format. h5i stores passed/failed/skipped counts, duration, coverage, and a human-readable summary alongside the commit note.
 
+**Causal Commit Chains**
+Declare which earlier commits causally triggered the current one (`--caused-by`). h5i stores the causal graph, surfaces it in `h5i log`, and warns during rollback if downstream commits depend on the one being reverted.
+
 **Rule-Based Integrity Engine**
-Twelve deterministic rules run before every `--audit` commit. No AI in the audit path. Rules detect credential leaks, dangerous execution patterns, CI/CD tampering, scope creep, and more.
+Twelve deterministic rules run before every `--audit` commit. No AI in the audit path. Rules detect credential leaks, dangerous execution patterns, CI/CD tampering, scope creep, and more. The web dashboard lets you audit any historical commit interactively.
 
 **Intent-Based Rollback**
 Describe what you want to undo in plain English. h5i semantically matches your description against stored prompts and commit messages, then reverts the right commit — no commit hash needed.
@@ -63,13 +67,6 @@ Requires Rust 1.70+ and an existing Git repository.
 ```bash
 git clone https://github.com/koukyosyumei/h5i
 cd h5i
-cargo build --release
-cp target/release/h5i /usr/local/bin/
-```
-
-Or install directly with Cargo:
-
-```bash
 cargo install --path .
 ```
 
@@ -100,22 +97,21 @@ export H5I_AGENT_ID=claude-code
 h5i commit -m "implement rate limiting"
 ```
 
-With the Claude Code hook installed (see §6), `--prompt` is captured automatically from your conversation.
+Resolution order: CLI flag → env var (`H5I_PROMPT`, `H5I_MODEL`, `H5I_AGENT_ID`) → pending context file (written by the Claude Code hook).
 
-Resolution order: CLI flag → env var (`H5I_PROMPT`, `H5I_MODEL`, `H5I_AGENT_ID`) → pending context file (written by the hook).
+With the hook installed (see §6), `--prompt` is captured automatically from your Claude Code conversation — zero friction.
 
 ### 4.2. Attaching Test Results
 
-h5i supports three ways to attach test results to a commit. All three write the same structured data to the commit note.
+h5i supports three ways to record test metrics alongside a commit. All three store the same structured data (passed/failed/skipped counts, duration, tool name, coverage) in the commit note.
 
-**Option A — pass a results file** (most common in CI):
+**Option A — pass a pre-computed results file** (recommended for CI):
 
 ```bash
-# Run your adapter, then commit
 python script/h5i-pytest-adapter.py > /tmp/results.json
 h5i commit -m "add login tests" --test-results /tmp/results.json
 
-# Or set via environment variable
+# Or via environment variable (useful in CI pipelines)
 export H5I_TEST_RESULTS=/tmp/results.json
 h5i commit -m "add login tests"
 ```
@@ -127,48 +123,88 @@ h5i commit -m "add login tests" \
   --test-cmd "python script/h5i-pytest-adapter.py"
 ```
 
-**Option C — scan staged files for `H5I_TEST_PASS` / `H5I_TEST_FAIL` markers** (language-agnostic fallback):
+**Option C — scan staged files for inline markers** (language-agnostic fallback):
 
 ```bash
 h5i commit -m "add login tests" --tests
+# Looks for // h5_i_test_start … // h5_i_test_end blocks in staged files
 ```
 
-#### Adapters
+#### Bundled adapters
 
-`script/h5i-pytest-adapter.py` — runs pytest, uses `pytest-json-report` when available, falls back to text parsing:
+`script/h5i-pytest-adapter.py` — runs pytest, uses `pytest-json-report` when available, falls back to output parsing:
 
 ```bash
 pip install pytest pytest-json-report   # one-time
 python script/h5i-pytest-adapter.py     # prints JSON to stdout
 ```
 
-`script/h5i-cargo-test-adapter.sh` — runs `cargo test` and accumulates counts across lib / integration / doc test sections:
+`script/h5i-cargo-test-adapter.sh` — runs `cargo test`, accumulates counts across lib / integration / doc-test sections:
 
 ```bash
-bash script/h5i-cargo-test-adapter.sh   # prints JSON to stdout
+bash script/h5i-cargo-test-adapter.sh  # prints JSON to stdout
 ```
 
-#### JSON adapter schema
+#### Writing your own adapter
 
-Any tool can produce compatible output. Write a file matching this schema and pass it via `--test-results`:
+Any tool can produce compatible output. Write a JSON file matching this schema and pass it via `--test-results`:
 
 ```json
 {
-  "tool":         "pytest",
-  "passed":       42,
-  "failed":       1,
-  "skipped":      3,
-  "total":        46,
+  "tool":          "jest",
+  "passed":        42,
+  "failed":        1,
+  "skipped":       3,
+  "total":         46,
   "duration_secs": 4.7,
-  "coverage":     0.87,
-  "exit_code":    1,
-  "summary":      "42 passed, 1 failed, 3 skipped in 4.70s"
+  "coverage":      0.87,
+  "exit_code":     1,
+  "summary":       "42 passed, 1 failed, 3 skipped in 4.70s"
 }
 ```
 
-All fields are optional. `exit_code` takes precedence over counts when determining pass/fail status.
+All fields are optional. `exit_code` takes precedence over counts when determining pass/fail; `total` is computed from counts if omitted.
 
-### 4.3. Auditing Before Commit
+### 4.3. Causal Commit Chains
+
+Declare which earlier commits causally triggered the current one — for example, "this commit fixes a bug introduced by commit X":
+
+```bash
+h5i commit -m "fix off-by-one in validate_token" \
+  --caused-by a3f9c2b \
+  --prompt "fix the bug introduced by the rate limiter"
+
+# Multiple causes are allowed
+h5i commit -m "unify auth flow" \
+  --caused-by a3f9c2b \
+  --caused-by d4e5f6a
+```
+
+Abbreviated OIDs are resolved to full OIDs at commit time; invalid OIDs are rejected with an error.
+
+The causal link is surfaced in `h5i log`:
+
+```
+commit b2f3a1c...
+Author:    Alice <alice@example.com>
+Agent:     claude-code (claude-sonnet-4-6)
+Caused by: a3f9c2b "implement rate limiting"
+Prompt:    "fix the off-by-one in validate_token"
+Tests:     ✔ 42 passed, 0 failed, 1.23s [pytest]
+```
+
+**Rollback cascade warning** — when rolling back a commit, h5i scans recent history for any commits that declared it as a cause, and warns before proceeding:
+
+```
+⚠ Warning: 2 later commits causally depend on this one:
+  → b2f3a1c "fix bug introduced by rate limiter"
+  → c3d4e5f "add test coverage for rate limiter"
+Continue anyway? [y/N]
+```
+
+Use `--yes` to skip the prompt in CI.
+
+### 4.4. Auditing Before Commit
 
 ```bash
 h5i commit -m "refactor auth module" --audit
@@ -182,7 +218,7 @@ h5i commit -m "refactor auth module" --audit
 
 Use `--force` to commit despite warnings. Violations block the commit by default.
 
-Flags can be combined:
+Flags can be combined freely:
 
 ```bash
 h5i commit -m "add rate limiter" \
@@ -190,28 +226,30 @@ h5i commit -m "add rate limiter" \
   --model claude-sonnet-4-6 \
   --agent claude-code \
   --test-results /tmp/results.json \
+  --caused-by d4e5f6a \
   --audit
 ```
 
-### 4.4. Enriched Commit Log
+### 4.5. Enriched Commit Log
 
 ```bash
 h5i log --limit 5
 ```
 
 ```
-commit a3f9c2b14...
-Author:   Alice <alice@example.com>
-Agent:    claude-code (claude-sonnet-4-6) 󱐋
-Prompt:   "implement per-IP rate limiting on the auth endpoint"
-Tests:    ✔ 42 passed, 0 failed, 1.23s [pytest]
+commit b2f3a1c...
+Author:    Alice <alice@example.com>
+Agent:     claude-code (claude-sonnet-4-6) 󱐋
+Caused by: a3f9c2b "implement rate limiting"
+Prompt:    "fix the off-by-one in validate_token"
+Tests:     ✔ 42 passed, 0 failed, 1.23s [pytest]
 
-    implement rate limiting
+    fix off-by-one in validate_token
 
 ────────────────────────────────────────────────────────────
 ```
 
-### 4.5. Semantic Blame
+### 4.6. Semantic Blame
 
 ```bash
 h5i blame src/auth.rs
@@ -225,7 +263,7 @@ STAT COMMIT   AUTHOR/AGENT    | CONTENT
       9eff001  alice           | }
 ```
 
-### 4.6. Intent-Based Rollback
+### 4.7. Intent-Based Rollback
 
 ```bash
 h5i rollback "the OAuth login changes"
@@ -252,43 +290,45 @@ h5i rollback "the broken migration" --yes  # skip confirmation in CI
 
 Falls back to keyword search if `ANTHROPIC_API_KEY` is not set.
 
-### 4.7. CRDT Collaborative Sessions
-
-Start a real-time recording session for a file. Each agent gets its own session; changes are merged via CRDT automatically.
+### 4.8. CRDT Collaborative Sessions
 
 ```bash
 h5i session --file src/auth.rs
 # → Watching for changes... (Press Ctrl+C to stop)
-```
 
-### 4.8. CRDT Merge Resolution
-
-```bash
 h5i resolve <ours-oid> <theirs-oid> src/auth.rs
 ```
 
-Resolves conflicts using the mathematical CRDT state stored in Git Notes — no interactive merge editor required.
+Each agent gets its own session; changes merge via CRDT automatically. `h5i resolve` reconstructs the conflict-free state from Git Notes — no interactive merge editor required.
 
 ### 4.9. Web Dashboard
 
 ```bash
-h5i serve            # opens on http://localhost:7150
+h5i serve            # http://localhost:7150
 h5i serve --port 8080
 ```
 
-The dashboard provides:
+The dashboard has three tabs:
 
-- **Timeline tab** — full commit history with colored test-status borders, rich test badges (`🧪 ✔42 ✖0 ⊘1`), per-commit GitHub links, and expandable detail panels showing AI prompt, model, and test breakdown tables.
-- **Inline audit** — every commit card shows a `🛡 Audit` button. Click it to run the twelve integrity rules against that commit's diff and see results inline, with a collapsible panel listing every rule checked and its outcome.
-- **Summary tab** — aggregate stats, agent leaderboard, and a list of commits with failing tests.
-- **Integrity tab** — manually audit any commit message + prompt against the rule engine without committing.
-- **Sidebar** — test health sparkline across all commits; links to the GitHub repository auto-detected from the `origin` remote.
+**Timeline** — full commit history with:
+- Colored left borders: green for passing tests, red for failing
+- Rich test badges showing `🧪 ✔42 ✖0 ⊘1` counts
+- Per-commit `↗ GitHub` links (auto-detected from the `origin` remote)
+- `⛓ caused by N` badge when a causal link is present
+- Expandable detail panels showing AI prompt, model, token count, and full test breakdown table
+- `🛡 Audit` button on every card — runs the twelve integrity rules against that commit's diff and shows results inline, with a collapsible panel listing every rule and its pass/fail status
+
+**Summary** — aggregate stats cards, agent leaderboard bar chart, and a list of commits with failing tests. Filter pills: `🤖 AI only`, `🧪 With tests`, `✖ Failing`.
+
+**Integrity** — manually audit any commit message + prompt against the rule engine without committing.
+
+The sidebar shows a test-health sparkline across all loaded commits.
 
 ---
 
 ## 5. Integrity Engine
 
-The `--audit` flag (and the dashboard's per-commit audit) runs twelve deterministic rules against the diff. Rules are pure string/stat checks — no AI, no network, no false trust.
+The `--audit` flag (and the dashboard's per-commit audit button) runs twelve deterministic rules against the diff. Rules are pure string/stat checks — no AI, no network, no false trust.
 
 | Rule | Severity | Trigger |
 |------|----------|---------|
@@ -323,7 +363,7 @@ This prints:
 1. A shell script to save at `~/.claude/hooks/h5i-capture-prompt.sh`
 2. The exact `~/.claude/settings.json` snippet to register the hook
 
-After setup, the prompt flows from your conversation → `.git/.h5i/pending_context.json` → consumed and cleared by the next `h5i commit`. No flags, no copy-paste.
+After setup, the prompt flows: conversation → `.git/.h5i/pending_context.json` → consumed and cleared by the next `h5i commit`. No flags, no copy-paste.
 
 **Environment variable fallback** (works without hooks, or with any AI agent):
 
@@ -340,16 +380,16 @@ h5i commit -m "add rate limiting"
 
 `examples/dnn-from-scratch` (also at [github.com/Koukyosyumei/dnn-from-scratch](https://github.com/Koukyosyumei/dnn-from-scratch)) is a self-contained Python project — a fully-connected neural network trained from scratch with NumPy — built entirely with Claude Code and version-controlled with h5i.
 
-It demonstrates the full workflow:
+It demonstrates the full workflow end-to-end:
 
 ```
 git init → h5i init → (write code → pytest → h5i commit --test-results …) × N
 ```
 
-The repo has eight h5i commits with full AI provenance (agent: `claude-code`, model: `claude-sonnet-4-6`), test metrics from `h5i-pytest-adapter.py`, and a `demo.sh` script that replays the entire session from scratch in a temp directory.
+The repo has eight h5i commits with full AI provenance (agent: `claude-code`, model: `claude-sonnet-4-6`) and test metrics attached via `h5i-pytest-adapter.py`.
 
 ```bash
-# Inspect the h5i history of the already-built repo
+# Show h5i log, blame, and run the XOR demo on the already-built repo
 bash examples/dnn-from-scratch/demo.sh --inspect
 
 # Replay the full build from scratch in a temp directory
@@ -371,7 +411,7 @@ h5i stores all metadata as a Git sidecar — nothing lives outside your reposito
     └── pending_context.json  # Transient: consumed at next commit
 ```
 
-Extended commit metadata — AI provenance, test metrics, integrity reports — is stored in Git Notes (`refs/notes/commits`) as JSON. Notes travel with the repository on push/fetch and are visible via standard Git tooling:
+Extended commit metadata — AI provenance, test metrics, causal links, integrity reports — is stored in Git Notes (`refs/notes/commits`) as JSON. Notes travel with the repository on push/fetch and are visible via standard Git tooling:
 
 ```bash
 git notes show <commit-oid>
