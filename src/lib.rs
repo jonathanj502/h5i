@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod ts_parser;
 pub mod compliance;
 pub mod policy;
 pub mod blame;

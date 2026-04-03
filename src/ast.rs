@@ -175,16 +175,11 @@ pub struct NamedBlock {
     pub sexp: String,
 }
 
-/// Declaration kinds that carry an identifier we can use for matching.
-const NAMED_KINDS: &[&str] = &["FunctionDef", "AsyncFunctionDef", "ClassDef"];
-
 fn extract_name(node: &SexpNode) -> Option<String> {
-    let kind = node.type_name()?;
-    if NAMED_KINDS.contains(&kind) {
-        node.field_atom("name")
-    } else {
-        None
-    }
+    // Any node that has a `(name 'x')` field is treated as a named declaration.
+    // The ts_parser emitter only adds this field to nodes we want to track, so
+    // no kind-list filter is needed here.
+    node.field_atom("name")
 }
 
 /// Parses a root s-expression and returns the top-level body declarations.
@@ -231,17 +226,22 @@ pub fn diff_summary(old_sexp: &str, new_sexp: &str) -> String {
     let new_node = parse_sexp(new_sexp);
     match (old_node, new_node) {
         (Some(old), Some(new)) => {
-            let sig_changed = old.field("args").map(|n| n.serialize())
-                != new.field("args").map(|n| n.serialize());
-            let body_changed = old.field("body").map(|n| n.serialize())
-                != new.field("body").map(|n| n.serialize());
-            let deco_changed = old.field("decorator_list").map(|n| n.serialize())
-                != new.field("decorator_list").map(|n| n.serialize());
-            match (sig_changed, body_changed, deco_changed) {
-                (true, true, _) => "signature and body changed".to_string(),
-                (true, false, _) => "signature changed".to_string(),
-                (false, true, _) => "body changed".to_string(),
-                (_, _, true) => "decorators changed".to_string(),
+            // Check `params` (tree-sitter emitter) then fall back to `args` (legacy Python).
+            let sig_changed = {
+                let old_sig = old.field("params").or_else(|| old.field("args")).map(|n| n.serialize());
+                let new_sig = new.field("params").or_else(|| new.field("args")).map(|n| n.serialize());
+                old_sig != new_sig
+            };
+            // Check `body_hash` (tree-sitter emitter) then fall back to `body` (legacy Python).
+            let body_changed = {
+                let old_body = old.field("body_hash").or_else(|| old.field("body")).map(|n| n.serialize());
+                let new_body = new.field("body_hash").or_else(|| new.field("body")).map(|n| n.serialize());
+                old_body != new_body
+            };
+            match (sig_changed, body_changed) {
+                (true, true) => "signature and body changed".to_string(),
+                (true, false) => "signature changed".to_string(),
+                (false, true) => "body changed".to_string(),
                 _ => "implementation changed".to_string(),
             }
         }
@@ -599,6 +599,28 @@ impl AstDiff {
 
 fn block_label(kind: &str, name: Option<&str>) -> String {
     let short = match kind {
+        // Rust (tree-sitter)
+        "function_item" => "fn",
+        "struct_item" => "struct",
+        "enum_item" => "enum",
+        "trait_item" => "trait",
+        "impl_item" => "impl",
+        "mod_item" => "mod",
+        "type_item" => "type",
+        "const_item" => "const",
+        "static_item" => "static",
+        "use_declaration" => "use",
+        // Python (tree-sitter)
+        "function_definition" => "fn",
+        "class_definition" => "class",
+        "import_statement" | "import_from_statement" => "import",
+        // JavaScript / TypeScript (tree-sitter)
+        "function_declaration" | "generator_function_declaration" => "fn",
+        "class_declaration" => "class",
+        "interface_declaration" => "interface",
+        "type_alias_declaration" => "type",
+        "enum_declaration" => "enum",
+        // Python legacy (hand-crafted s-expressions, kept for stored blob compat)
         "FunctionDef" => "fn",
         "AsyncFunctionDef" => "async fn",
         "ClassDef" => "class",

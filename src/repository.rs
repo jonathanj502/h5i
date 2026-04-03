@@ -1364,47 +1364,13 @@ impl H5iRepository {
         &self.h5i_root
     }
 
-    /// Reads the pending AI context written by a Claude Code hook.
+    /// Returns a closure that parses a source file into a normalized h5i
+    /// s-expression string using tree-sitter.
     ///
-    /// Returns `None` if no pending context file exists.
-    /// Returns a closure that parses a source file into an s-expression string.
-    ///
-    /// Language detection is based on file extension. The appropriate parser
-    /// script is discovered by searching, in order:
-    ///   1. `$H5I_PARSER_DIR`
-    ///   2. `<repo_workdir>/script/`
-    ///   3. Directory containing the current executable (`../script/`)
-    ///
-    /// Currently supported extensions: `.py` (via `h5i-py-parser.py`).
+    /// Supported extensions: `.rs`, `.py`, `.js`, `.mjs`, `.cjs`, `.ts`,
+    /// `.mts`, `.cts`, `.tsx`.  Returns `None` for unsupported file types.
     pub fn make_ast_parser(&self) -> Box<dyn Fn(&std::path::Path) -> Option<String>> {
-        let workdir = self.git_repo.workdir().map(|p| p.to_path_buf());
-
-        Box::new(move |path: &std::path::Path| {
-            let ext = path.extension()?.to_str()?;
-
-            // Resolve the script path for the detected language.
-            let script_name = match ext {
-                "py" => "h5i-py-parser.py",
-                _ => return None,
-            };
-
-            let script_path = find_parser_script(script_name, workdir.as_deref())?;
-
-            let output = std::process::Command::new("python3")
-                .arg(&script_path)
-                .arg(path)
-                .output()
-                .ok()?;
-
-            if output.status.success() {
-                String::from_utf8(output.stdout)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-            } else {
-                None
-            }
-        })
+        Box::new(|path: &std::path::Path| crate::ts_parser::parse_to_sexp(path))
     }
 
     /// Computes the structural (AST-level) diff for `path` between two versions.
@@ -1444,7 +1410,7 @@ impl H5iRepository {
                 parser(&abs).ok_or_else(|| {
                     H5iError::Ast(format!(
                         "No parser available for '{}'. \
-                         Ensure python3 and the parser script are accessible.",
+                         Supported extensions: .rs .py .js .ts .tsx",
                         path.display()
                     ))
                 })?
@@ -2714,46 +2680,6 @@ fn is_artifact_path(path: &str) -> bool {
 }
 
 // ── Parser script discovery ───────────────────────────────────────────────────
-
-/// Searches for `script_name` in the standard locations and returns the first
-/// path that exists.
-fn find_parser_script(
-    script_name: &str,
-    workdir: Option<&std::path::Path>,
-) -> Option<std::path::PathBuf> {
-    // 1. Explicit override via environment variable.
-    if let Ok(dir) = std::env::var("H5I_PARSER_DIR") {
-        let p = std::path::Path::new(&dir).join(script_name);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-
-    // 2. `script/` inside the repository working directory.
-    if let Some(wd) = workdir {
-        let p = wd.join("script").join(script_name);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-
-    // 3. Relative to the h5i binary (`<bin_dir>/../script/` for development builds,
-    //    `<bin_dir>/script/` for flat installs).
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(bin_dir) = exe.parent() {
-            for candidate in &[
-                bin_dir.join("script").join(script_name),
-                bin_dir.join("..").join("script").join(script_name),
-            ] {
-                if candidate.exists() {
-                    return Some(candidate.clone());
-                }
-            }
-        }
-    }
-
-    None
-}
 
 // ============ Decisions ============
 
